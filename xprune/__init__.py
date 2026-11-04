@@ -1,3 +1,3 @@
-"""Archive your old X posts, then delete them through the official X API."""
+"""Delete your X posts older than N days through the official X API."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"

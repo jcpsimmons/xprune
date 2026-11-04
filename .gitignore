@@ -3,7 +3,4 @@ __pycache__/
 build/
 dist/
 .venv/
-*.db
-*.db-journal
 .env
-raw/

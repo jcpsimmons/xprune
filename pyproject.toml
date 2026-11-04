@@ -4,16 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xprune"
-version = "0.1.0"
-description = "Archive your old X posts to SQLite or Postgres, then delete them through the official X API."
+version = "0.2.0"
+description = "Delete your X posts older than N days through the official X API."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"
 authors = [{ name = "Dr. Josh C. Simmons" }]
 dependencies = []
-
-[project.optional-dependencies]
-postgres = ["psycopg[binary]>=3.1"]
 
 [project.scripts]
 xprune = "xprune.cli:main"

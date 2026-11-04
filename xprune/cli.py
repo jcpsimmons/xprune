@@ -1,22 +1,23 @@
-"""xprune: archive your old X posts, then delete them."""
+"""xprune: delete your X posts older than N days through the official X API."""
 
 from __future__ import annotations
 
 import argparse
 import os
 import sys
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
 from .api import Client
-from .core import archive, count, delete_pending, iso
-from .store import Store, parse_ts
+from .core import count, delete_posts, find_posts, iso
 
 # Pay-per-use prices from https://docs.x.com/x-api/getting-started/pricing, checked October 2026.
 PRICE_READ = 0.005
 PRICE_DELETE = 0.010
 PRICE_COUNT_REQUEST = 0.010
+TYPES = ("original", "reply", "quote", "repost")
 
 
 def lock_or_exit(path: Path):
@@ -33,14 +34,9 @@ def lock_or_exit(path: Path):
     return handle
 
 
-def window(args, store: Store, user: dict) -> tuple[datetime, datetime]:
-    end = datetime.now(timezone.utc) - timedelta(days=args.older_than)
-    if args.since:
-        start = parse_ts(args.since)
-    else:
-        newest = store.newest(user["id"])
-        start = newest + timedelta(seconds=1) if newest else parse_ts(user["created_at"])
-    return start, end
+def parse_ts(value: str) -> datetime:
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def require_write(level: str) -> None:
@@ -51,90 +47,67 @@ def require_write(level: str) -> None:
         )
 
 
-def print_summary(store: Store, user_id: str) -> None:
-    rows = store.summary(user_id)
-    if not rows:
-        print("archive is empty")
-        return
-    print(f"{'type':<10}{'status':<12}{'posts':>8}")
-    for kind, status, n in rows:
-        print(f"{kind:<10}{status:<12}{n:>8}")
-
-
 def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="xprune", description=__doc__)
     ap.add_argument("--version", action="version", version=__version__)
-    ap.add_argument("--db", default=os.environ.get("XPRUNE_DB", "xprune.db"),
-                    help="SQLite file path or postgres:// URL (default: $XPRUNE_DB or ./xprune.db)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def windowed(p):
         p.add_argument("--older-than", type=int, default=90, metavar="DAYS", help="age cutoff in days (default 90)")
-        p.add_argument("--since", help="start of the window (ISO time). Default: newest archived post, or account creation")
+        p.add_argument("--since", help="only posts after this ISO time (default: account creation)")
 
-    windowed(sub.add_parser("count", help="count posts in the window and estimate the cost"))
-    p = sub.add_parser("archive", help="save posts in the window to the database (no deletes)")
+    windowed(sub.add_parser("count", help="count posts older than the cutoff and estimate the cost"))
+    p = sub.add_parser("delete", help="delete posts older than the cutoff (dry run unless --yes)")
     windowed(p)
-    p.add_argument("--raw-dir", type=Path, help="also save raw API pages here")
-    p = sub.add_parser("delete", help="delete posts that are already archived")
-    p.add_argument("--limit", type=int, help="delete at most N posts (try 1 first)")
-    p.add_argument("--retry-failed", action="store_true", help="put failed rows back in the queue first")
-    p.add_argument("--yes", action="store_true", help="required: confirms you want posts deleted from X")
-    p = sub.add_parser("run", help="archive the window, then delete it (dry run unless --yes)")
-    windowed(p)
-    p.add_argument("--raw-dir", type=Path)
-    p.add_argument("--yes", action="store_true", help="actually delete; without it, run only archives")
-    sub.add_parser("status", help="show archived posts by type and delete status")
+    p.add_argument("--types", default=",".join(TYPES),
+                   help=f"comma-separated post types to delete (default: {','.join(TYPES)})")
+    p.add_argument("--limit", type=int, help="delete at most N posts, oldest first (try 1 first)")
+    p.add_argument("--yes", action="store_true", help="actually delete; without it, only lists what would go")
     args = ap.parse_args(argv)
 
     client = Client.from_env()
-    store = Store(args.db)
     user, level = client.me()
     print(f"@{user['username']} ({level or 'access level unknown'})", file=sys.stderr)
-
-    if args.cmd == "status":
-        print_summary(store, user["id"])
+    end = datetime.now(timezone.utc) - timedelta(days=args.older_than)
+    start = parse_ts(args.since) if args.since else parse_ts(user["created_at"])
+    if start >= end:
+        print("nothing is older than the cutoff")
         return
 
     if args.cmd == "count":
-        start, end = window(args, store, user)
-        if start >= end:
-            print("nothing in the window")
-            return
         n = count(client, user["username"], start, end)
         print(f"{n} posts from {iso(start)} to {iso(end)}")
-        print(f"estimated cost: about ${n * PRICE_READ:.2f} to archive and ${n * PRICE_DELETE:.2f} to delete "
-              f"(prices as of October 2026; check the X developer console). This count cost about "
-              f"${PRICE_COUNT_REQUEST * max(1, (end - start).days // 30 + 1):.2f}.")
+        print(f"estimated cost: about ${n * (PRICE_READ + PRICE_DELETE):.2f} to delete them "
+              f"(prices as of October 2026; check the X developer console). "
+              f"This count cost about ${PRICE_COUNT_REQUEST * ((end - start).days // 30 + 1):.2f}.")
         return
 
+    types = {t.strip() for t in args.types.split(",") if t.strip()}
+    unknown = types - set(TYPES)
+    if unknown:
+        raise SystemExit(f"unknown post types: {', '.join(sorted(unknown))}")
     lock = lock_or_exit(Path(os.environ.get("XPRUNE_LOCK", Path.home() / ".xprune.lock")))
+    posts = [p for p in find_posts(client, user["username"], start, end) if p.type in types]
+    if args.limit:
+        posts = posts[:args.limit]
+    by_type = Counter(p.type for p in posts)
+    print(f"{len(posts)} posts from {iso(start)} to {iso(end)}: "
+          + (", ".join(f"{by_type[t]} {t}" for t in TYPES if by_type[t]) or "none"))
+    if not posts:
+        return
+    if not args.yes:
+        print(f"dry run: nothing deleted. Deleting these costs about ${len(posts) * PRICE_DELETE:.2f}; "
+              "re-run with --yes.")
+        return
 
-    if args.cmd in ("archive", "run"):
-        start, end = window(args, store, user)
-        if start >= end:
-            print("no posts have crossed the cutoff since the last run")
-        else:
-            n = archive(client, store, user["username"], start, end, args.raw_dir)
-            print(f"archived {n} posts from {iso(start)} to {iso(end)}")
-        if args.cmd == "archive" or not args.yes:
-            if args.cmd == "run":
-                print("dry run: nothing deleted. Re-run with --yes to delete what is archived.")
-            print_summary(store, user["id"])
-            return
-
-    if args.cmd == "delete" and not args.yes:
-        raise SystemExit("delete removes posts from X permanently; add --yes to confirm")
     require_write(level)
-    if getattr(args, "retry_failed", False):
-        store.retry_failed(user["id"])
-    counts = delete_pending(client, store, user["id"], limit=getattr(args, "limit", None))
+    counts = delete_posts(client, user["id"], posts)
     print(f"deleted {counts['deleted']}, not found {counts['not_found']}, failed {counts['failed']}")
+    del lock
     if counts.get("stopped_on_auth_error"):
         sys.exit(2)
     if counts["failed"]:
         sys.exit(1)
-    del lock
 
 
 if __name__ == "__main__":
