@@ -6,7 +6,7 @@ import json
 import threading
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import NamedTuple
 
 from .api import Client
@@ -50,9 +50,8 @@ def count(client: Client, username: str, start: datetime, end: datetime) -> int:
         time.sleep(1.1)
 
 
-def find_posts(client: Client, username: str, start: datetime, end: datetime) -> list[Post]:
-    """List every post in [start, end), oldest first. Asks only for the fields needed to delete, with no
-    expansions, so X bills only the posts themselves."""
+def _search(client: Client, username: str, start: datetime, end: datetime) -> list[Post]:
+    """Every post in [start, end), oldest first."""
     found, token = [], None
     while True:
         params = {"query": f"from:{username}", "start_time": iso(start), "end_time": iso(end),
@@ -64,9 +63,31 @@ def find_posts(client: Client, username: str, start: datetime, end: datetime) ->
             kind, ref = classify(p)
             found.append(Post(p["id"], p["created_at"], kind, ref))
         token = data.get("meta", {}).get("next_token")
+        time.sleep(1.1)
         if not token:
             return sorted(found, key=lambda p: p.created_at)
-        time.sleep(1.1)
+
+
+def find_posts(client: Client, username: str, start: datetime, end: datetime, types: set[str] | None = None,
+               limit: int | None = None, chunk_days: int = 30) -> list[Post]:
+    """List posts in [start, end), oldest first, keeping only `types`. Asks only for the fields needed to
+    delete, with no expansions, so X bills only the posts themselves.
+
+    Search returns newest first, so with a limit the window is searched in chunks from the oldest end and
+    the search stops once enough posts are found. That keeps a `--limit 1` test from paying to read the
+    whole history."""
+    windows = [(start, end)]
+    if limit:
+        windows, s = [], start
+        while s < end:
+            windows.append((s, min(s + timedelta(days=chunk_days), end)))
+            s += timedelta(days=chunk_days)
+    found: list[Post] = []
+    for s, e in windows:
+        found += [p for p in _search(client, username, s, e) if types is None or p.type in types]
+        if limit and len(found) >= limit:
+            return found[:limit]
+    return found
 
 
 def delete_posts(client: Client, me_id: str, posts: list[Post], progress_every: int = 100) -> Counter:

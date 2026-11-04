@@ -2,7 +2,9 @@ import unittest
 from unittest import mock
 
 from xprune.api import oauth1_header
-from xprune.core import Post, classify, delete_posts
+from datetime import datetime, timezone
+
+from xprune.core import Post, classify, delete_posts, find_posts
 
 
 class OAuthTest(unittest.TestCase):
@@ -62,6 +64,46 @@ class DeleteTest(unittest.TestCase):
         counts = delete_posts(client, "42", posts)
         self.assertTrue(counts["stopped_on_auth_error"])
         self.assertEqual(client.request.call_count, 1)
+
+
+class FindTest(unittest.TestCase):
+    def setUp(self):
+        patcher = mock.patch("xprune.core.time.sleep")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def client(self, posts):
+        """Fake search: returns the posts inside the requested window, newest first, like X."""
+        client = mock.Mock()
+        client.calls = []
+
+        def get(path, params, app=False):
+            client.calls.append((params["start_time"], params["end_time"]))
+            hits = [p for p in posts if params["start_time"] <= p["created_at"][:19] + "Z" < params["end_time"]]
+            return {"data": sorted(hits, key=lambda p: p["created_at"], reverse=True), "meta": {}}
+
+        client.get.side_effect = get
+        return client
+
+    def test_limit_stops_at_oldest_chunk(self):
+        posts = [{"id": "1", "created_at": "2020-01-05T00:00:00.000Z"},
+                 {"id": "2", "created_at": "2020-01-10T00:00:00.000Z",
+                  "referenced_tweets": [{"type": "retweeted", "id": "9"}]},
+                 {"id": "3", "created_at": "2024-06-01T00:00:00.000Z"}]
+        client = self.client(posts)
+        start, end = datetime(2020, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.assertEqual([p.id for p in find_posts(client, "me", start, end, limit=1)], ["1"])
+        self.assertEqual(len(client.calls), 1)
+        found = find_posts(client, "me", start, end, types={"repost"}, limit=5)
+        self.assertEqual([(p.id, p.ref_id) for p in found], [("2", "9")])
+
+    def test_no_limit_is_one_window(self):
+        posts = [{"id": "3", "created_at": "2024-06-01T00:00:00.000Z"},
+                 {"id": "1", "created_at": "2020-01-05T00:00:00.000Z"}]
+        client = self.client(posts)
+        start, end = datetime(2020, 1, 1, tzinfo=timezone.utc), datetime(2025, 1, 1, tzinfo=timezone.utc)
+        self.assertEqual([p.id for p in find_posts(client, "me", start, end)], ["1", "3"])
+        self.assertEqual(len(client.calls), 1)
 
 
 if __name__ == "__main__":

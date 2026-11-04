@@ -86,10 +86,10 @@ def main(argv: list[str] | None = None) -> None:
     unknown = types - set(TYPES)
     if unknown:
         raise SystemExit(f"unknown post types: {', '.join(sorted(unknown))}")
+    if args.yes:
+        require_write(level)  # before searching, so a read-only token doesn't pay for reads first
     lock = lock_or_exit(Path(os.environ.get("XPRUNE_LOCK", Path.home() / ".xprune.lock")))
-    posts = [p for p in find_posts(client, user["username"], start, end) if p.type in types]
-    if args.limit:
-        posts = posts[:args.limit]
+    posts = find_posts(client, user["username"], start, end, types, args.limit)
     by_type = Counter(p.type for p in posts)
     print(f"{len(posts)} posts from {iso(start)} to {iso(end)}: "
           + (", ".join(f"{by_type[t]} {t}" for t in TYPES if by_type[t]) or "none"))
@@ -100,7 +100,6 @@ def main(argv: list[str] | None = None) -> None:
               "re-run with --yes.")
         return
 
-    require_write(level)
     counts = delete_posts(client, user["id"], posts)
     print(f"deleted {counts['deleted']}, not found {counts['not_found']}, failed {counts['failed']}")
     del lock
